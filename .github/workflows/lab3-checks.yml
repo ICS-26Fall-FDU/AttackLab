@@ -1,0 +1,128 @@
+name: Lab3 checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lab3-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-report:
+    name: Check report PDF
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Find report PDF in repository root
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' reports < <(find . -maxdepth 1 -type f -iname '*.pdf' -print0)
+
+          if (( ${#reports[@]} == 0 )); then
+            echo "::error::No PDF report found in the repository root"
+            exit 1
+          fi
+
+          echo "Found report PDF(s):"
+          printf '  %s\n' "${reports[@]#./}"
+
+  test-payloads:
+    name: Test every exploit payload
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Prepare target binaries
+        run: |
+          chmod +x attack/dark-calc attack/dark-calc-nx attack/dark-log attack/malware
+          file attack/dark-calc attack/dark-calc-nx attack/dark-log
+
+      - name: Test each payload
+        shell: bash
+        run: |
+          set -uo pipefail
+          ulimit -c 0
+          workdir="$(mktemp -d)"
+          trap 'rm -rf "$workdir"' EXIT
+
+          # payload script | target binary | required output
+          cases=(
+            "payload.py|dark-calc|You have successfully detonated the bomb! Congratulations!"
+            "payload_dark.py|dark-calc|Hope A will be your grade!"
+            "payload_rop.py|dark-calc-nx|Hope A will be your grade!"
+            "payload_canary.py|dark-log|Hope A will be your grade!"
+          )
+
+          tested=()
+          failures=0
+
+          for case in "${cases[@]}"; do
+            IFS='|' read -r payload target expected <<< "$case"
+            tested+=("$payload")
+            echo "::group::Test $payload -> attack/$target"
+
+            if [[ ! -f "$payload" ]]; then
+              echo "::error file=$payload::Payload script is missing"
+              failures=$((failures + 1))
+              echo "::endgroup::"
+              continue
+            fi
+
+            if ! timeout 15s python3 "$payload" > "$workdir/payload.bin" 2> "$workdir/generate.err"; then
+              echo "::error file=$payload::Could not generate payload"
+              cat "$workdir/generate.err"
+              failures=$((failures + 1))
+              echo "::endgroup::"
+              continue
+            fi
+            if [[ ! -s "$workdir/payload.bin" ]]; then
+              echo "::error file=$payload::Generated payload is empty"
+              failures=$((failures + 1))
+              echo "::endgroup::"
+              continue
+            fi
+
+            status=0
+            ( cd attack && timeout 15s "./$target" < "$workdir/payload.bin" > "$workdir/stdout.txt" 2> "$workdir/stderr.txt" ) || status=$?
+
+            echo "--- target stdout ---"
+            cat -v "$workdir/stdout.txt"
+            if [[ -s "$workdir/stderr.txt" ]]; then
+              echo "--- target stderr ---"
+              cat -v "$workdir/stderr.txt"
+            fi
+
+            echo "--- target exit status: $status ---"
+            if ! grep -Fq -- "$expected" "$workdir/stdout.txt"; then
+              echo "::error file=$payload::Missing expected output: $expected"
+              failures=$((failures + 1))
+            else
+              echo "PASS: $payload -> attack/$target"
+            fi
+
+            echo "::endgroup::"
+          done
+
+          if [[ "$failures" -ne 0 ]]; then
+            echo "::error::$failures payload test(s) failed"
+            exit 1
+          fi
+          echo "All ${#tested[@]} payloads passed."
